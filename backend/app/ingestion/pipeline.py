@@ -220,7 +220,7 @@ class IngestionPipeline:
             if not name or len(name) < MIN_NAME_LEN or not normalize_query(name):
                 stats["skipped"] += 1
                 continue
-            if not raw.prices:
+            if not raw.prices and not raw.modifiers:
                 # name without price — still useful as alias evidence, no price record
                 res = self.xref.resolve(name, use_cache=False)
                 if res.examination:
@@ -235,7 +235,9 @@ class IngestionPipeline:
                 continue
 
             # Dedup identical (name, code, first price) within doc
-            key = normalize_query(name) + "|" + str(raw.code or "") + "|" + str(raw.prices[0].value)
+            # rows that only carry modifiers have no base price to key on
+            first_value = raw.prices[0].value if raw.prices else "modifiers_only"
+            key = normalize_query(name) + "|" + str(raw.code or "") + "|" + str(first_value)
             seen_names[key] = seen_names.get(key, 0) + 1
             if seen_names[key] > 1:
                 stats["skipped"] += 1
@@ -405,6 +407,9 @@ class IngestionPipeline:
     # ------------------------------------------------------------------
     def ingest_file(self, path: Path, *, original_filename: str | None = None) -> dict[str, Any]:
         doc, dup = self.register_file(path, original_filename=original_filename)
+        # Persist the registration before the risky part: a parser or persistence
+        # failure must leave a document row behind, not erase it.
+        self.db.commit()
         if dup:
             return {
                 "document_id": doc.id,

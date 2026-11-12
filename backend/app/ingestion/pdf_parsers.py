@@ -239,10 +239,12 @@ def _parse_syndicate_table(table: list[list[str | None]], page_no: int, rows: li
                 else:
                     fifty_left = [j for j, t2 in enumerate(header_texts) if re.search(r"50\s*%", t2)]
                     cat = "member_parents_50" if (fifty_left and col == fifty_left[0]) else "member_project_50"
+            elif cats[col]:
+                # Header evidence beats positional guessing: the label in the
+                # source column is the only reliable statement of what it is.
+                cat = map_price_category(cats[col])
             elif pi < len(default_cats):
                 cat = default_cats[pi]
-            elif cats[col]:
-                cat = map_price_category(cats[col])
             else:
                 cat = f"price_{pi + 1}"
             prices.append(RawPrice(value=val, category=cat, currency="EGP"))
@@ -488,6 +490,143 @@ def _parse_clinic_fees(text: str) -> list[RawRow]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Procedure component tables (surgeon / anesthesia / assistants / OR room)
+# ---------------------------------------------------------------------------
+# Some syndicate sections are not price lists. Each row is one procedure and the
+# columns are the cost components of that procedure. A component is not a tariff
+# price, so these land in pricing_modifiers and never in price_values.
+COMPONENT_LABELS: dict[str, str] = {
+    "مستوى الاجراء الطبي": "procedure_level",
+    "فتح غرفة العمليات": "or_room",
+    "الجراح": "surgeon_fee",
+    "التخدير": "anesthesia",
+    "المساعدين": "assistants",
+}
+
+
+def _ar_norm(s: str) -> str:
+    # NFKC folds the presentation ligature `ﻻ` back to `لا`, which otherwise
+    # survives reversal and stops "مستوى الإجراء" from ever matching.
+    import unicodedata
+
+    s = unicodedata.normalize("NFKC", s)
+    return s.replace("إ", "ا").replace("أ", "ا").replace("آ", "ا").replace("\u200f", "")
+
+
+def _component_key(header_cell) -> str | None:
+    """Map a header cell to a component key, tolerating RTL visual order."""
+    raw = _cell_str(header_cell) or ""
+    fixed = _fix_cell(raw) or ""
+    candidates = {raw, fixed, raw[::-1], fixed[::-1]}
+    for cand in candidates:
+        c = _ar_norm(cand)
+        for label, key in COMPONENT_LABELS.items():
+            if _ar_norm(label) in c:
+                return key
+    return None
+
+
+def _is_component_table(header: list) -> bool:
+    """Three or more known component columns is a component breakdown table.
+
+    The procedure-name column is expected to be the one left unmatched.
+    """
+    keys = {_component_key(c) for c in header}
+    return len({k for k in keys if k}) >= 3
+
+
+def _parse_component_table(table: list[list], page_no: int, rows: list) -> None:
+    from app.normalization import fix_rtl_visual_order
+
+    header = list(table[0])
+    col_keys = {i: _component_key(c) for i, c in enumerate(header)}
+    name_cols = [i for i, k in col_keys.items() if k == "procedure_level"]
+    if name_cols:
+        name_col = name_cols[0]
+    else:
+        # the descriptive column is whatever is not a component amount
+        candidates = [i for i in range(len(header)) if col_keys.get(i) is None]
+        if not candidates:
+            return
+        if len(candidates) > 1:
+            def _text_ratio(i: int) -> float:
+                cells = [_cell_str(r[i]) if i < len(r) else None for r in table[1:]]
+                cells = [c for c in cells if c]
+                if not cells:
+                    return 0.0
+                return sum(1 for c in cells if parse_number(c) is None) / len(cells)
+            candidates.sort(key=_text_ratio, reverse=True)
+        name_col = candidates[0]
+    labeled = len({k for k in col_keys.values() if k}) >= 3
+    if labeled:
+        mod_cols: dict[int, str | None] = {
+            i: k for i, k in col_keys.items() if k and k != "procedure_level"
+        }
+    else:
+        # Most pages repeat no header row at all. Never guess a fee type here:
+        # keep every numeric column, label it by its own header if any, and let
+        # the review queue decide what it is.
+        mod_cols = {}
+        for i in range(len(header)):
+            if i == name_col:
+                continue
+            cells = [_cell_str(r[i]) if i < len(r) else None for r in table[1:]]
+            numeric = [c for c in cells if parse_number(c) is not None]
+            if not numeric:
+                continue
+            codeish = sum(1 for c in numeric if looks_like_code(c or "")) / len(numeric)
+            if codeish > 0.6:
+                continue  # procedure code column, not an amount
+            mod_cols[i] = None
+    if not mod_cols:
+        return
+
+    for row in table[1:]:
+        if not row:
+            continue
+        raw_name = _cell_str(row[name_col]) if name_col < len(row) else None
+        # these tables come out in visual order: restore logical order for display
+        name = clean_service_name(fix_rtl_visual_order(raw_name) if raw_name else None)
+        if not name:
+            continue
+
+        mods: list[RawModifier] = []
+        for col, key in sorted(mod_cols.items()):
+            if col >= len(row):
+                continue
+            val = parse_number(row[col])
+            if val is None:
+                continue
+            label = _fix_cell(_cell_str(header[col])) or key or f"عمود {col + 1}"
+            if key:
+                mods.append(RawModifier(mod_type=key, label=label, value=val, source_page=page_no))
+            else:
+                mods.append(RawModifier(
+                    mod_type="unlabeled_component",
+                    label=label,
+                    value=val,
+                    source_page=page_no,
+                    conditions="عمود بلا عنوان في المصدر — يحتاج مراجعة لتحديد نوع الرسم",
+                ))
+        if not mods:
+            # section heading or a note row, not a priced procedure
+            continue
+
+        ar, en = split_name_bilingual(name)
+        rows.append(RawRow(
+            name=name,
+            name_ar=ar,
+            name_en=en,
+            category="Procedure",
+            prices=[],           # no base price exists in this table — none invented
+            modifiers=mods,
+            page=page_no,
+            confidence=0.8 if labeled else 0.5,
+            parser="components",
+        ))
+
+
 def parse_pdf(path: Path) -> ParsedDoc:
     warnings: list[str] = []
     needs_ocr: list[int] = []
@@ -532,6 +671,8 @@ def parse_pdf(path: Path) -> ParsedDoc:
             except Exception:
                 ts = []
             sample_tables.extend(ts)
+        # component breakdown tables carry no tariff price at all
+        component_mode = any(_is_component_table(t[0]) for t in sample_tables if t and t[0])
         kind_scores = {"syndicate": 0, "lab_list": 0, "simple_4": 0, "generic": 0}
         for t in sample_tables[:6]:
             k, s = _header_score(t[0])
@@ -563,6 +704,9 @@ def parse_pdf(path: Path) -> ParsedDoc:
             use = k if s >= 3 else layout
             for table in tables:
                 if len(table) < 2:
+                    continue
+                if component_mode:
+                    _parse_component_table(table, pi, rows)
                     continue
                 before = len(rows)
                 if use == "syndicate":

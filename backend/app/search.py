@@ -23,6 +23,7 @@ from app.models import (
     Tariff,
 )
 from app.normalization import normalize_query, similar
+from app.reporting import reported_categories_filter
 from app.xref import Resolution, XRefEngine
 
 
@@ -187,6 +188,11 @@ class SearchEngine:
             conds.append(Provider.governorate.ilike(f"%{governorate}%"))
         if price_category:
             conds.append(PriceValue.price_category == price_category)
+        else:
+            # Centres with a reporting rule (e.g. the syndicate lists report the
+            # member price only) are filtered here; their other prices remain
+            # stored and are reachable by asking for that category explicitly.
+            conds.append(reported_categories_filter())
 
         base = (
             self.db.query(PriceValue, PriceRecord, Examination, Tariff, Provider, SourceDocument)
