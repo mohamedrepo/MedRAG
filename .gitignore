@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Data that should not be committed
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/backup_*
+storage/documents/*
+storage/logs/*
+storage/exports/*
+
+# Keep folder structure
+!storage/documents/.gitkeep
+!data/.gitkeep
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Third-party tariff documents (other organizations' price lists).
+# This repository is public; these are not ours to redistribute.
+# Same reason the copies under storage/documents/ are ignored.
+/*.pdf
+/*.xlsx
+/المختبر و البرج/
+/مركز النيل للاشعه/
+/نقابة الاطباء 2026/
+/مركز الطاهرة/
+*.pdf
+*.xlsx
+*.xls
+*.docx
+*.pptx
+
+# Env
+.env
+
+# OS
+Thumbs.db
+.DS_Store
