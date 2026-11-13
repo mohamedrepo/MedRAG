@@ -43,3 +43,7 @@ frontend/dist/
 # OS
 Thumbs.db
 .DS_Store
+
+# vision decode working files
+.tmp_vision/
+data/*.log

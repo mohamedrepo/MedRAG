@@ -27,7 +27,7 @@ from app.ingestion.base import (
     parse_number,
     split_name_bilingual,
 )
-from app.normalization import has_arabic
+from app.normalization import AR_DIGITS, has_arabic
 
 
 def _fix_cell(s: str | None) -> str | None:
@@ -41,6 +41,37 @@ def _fix_cell(s: str | None) -> str | None:
     return s or None
 
 
+def _header_cell(s: str | None) -> str:
+    """Header text for detection: RTL-repaired with Arabic-Indic digits folded
+    to ASCII so "٤٠٪" and "40%" behave identically."""
+    t = _fix_cell(s) or ""
+    return t.translate(AR_DIGITS)
+
+
+def _header_texts(s: str | None) -> list[str]:
+    """Both orientations of a header cell.
+
+    pdfplumber emits visual-order Arabic for some PDFs and logical order for
+    others; fix_rtl_visual_order is an involution, so testing the cell and its
+    reverse makes detection orientation-agnostic (same trick _component_key
+    uses). Without this, a logical-order "الكود" becomes "دوكلا" and the code
+    column is silently misclassified as a price column.
+    """
+    fixed = _header_cell(s)
+    if not fixed:
+        return []
+    rev = fixed[::-1]
+    return [fixed] if rev == fixed else [fixed, rev]
+
+
+def _header_has(cell, *needles: str) -> bool:
+    return any(
+        n in t.lower()
+        for t in _header_texts(cell)
+        for n in needles
+    )
+
+
 def _page_text_chars(page) -> int:
     try:
         return len(page.extract_text() or "")
@@ -51,6 +82,48 @@ def _page_text_chars(page) -> int:
 def _extract_tables(page) -> list[list[list[str | None]]]:
     tables = page.extract_tables() or []
     return [t for t in tables if t and len(t) >= 2]
+
+
+# ---------------------------------------------------------------------------
+# Glyph-corruption fallback
+#
+# Some embedded fonts carry a broken ToUnicode CMap: pdfminer maps whole
+# families of glyphs to the never-used codepoints U+063B..U+063F
+# (ػ ؼ ؽ ؾ ؿ), scrambling the extracted names. MuPDF ships its own
+# CMap handling and reads the same pages correctly, so when a page's text
+# contains those codepoints we re-extract its tables with PyMuPDF instead.
+# The cell shape and visual-order text are identical to pdfplumber's, so the
+# parsers downstream need no changes.
+# ---------------------------------------------------------------------------
+_GARBLE_RE = re.compile(r"[\u063b-\u063f]")
+_MUPDF_DOCS: dict[str, "object"] = {}
+
+
+def _page_text_garbled(page) -> bool:
+    try:
+        t = page.extract_text() or ""
+    except Exception:
+        return False
+    return bool(_GARBLE_RE.search(t))
+
+
+def _mupdf_tables(path: str, page_index: int) -> list[list[list[str | None]]]:
+    import pymupdf
+
+    doc = _MUPDF_DOCS.get(path)
+    if doc is None:
+        doc = pymupdf.open(path)
+        _MUPDF_DOCS[path] = doc
+    try:
+        found = doc[page_index].find_tables()
+        tables = []
+        for t in found.tables:
+            rows = t.extract()
+            if rows and len(rows) >= 2:
+                tables.append(rows)
+        return tables
+    except Exception:
+        return []
 
 
 def _cell_str(cell) -> str | None:
@@ -80,14 +153,17 @@ HEADER_TOKENS = {
 def _header_score(row: list[str | None]) -> tuple[str, int]:
     texts = []
     for c in row:
-        t = _fix_cell(_cell_str(c)) or ""
-        texts.append(t.lower())
+        for t in _header_texts(c):
+            texts.append(t.lower())
     joined = " | ".join(texts)
     score = 0
     kind = "generic"
-    if any(t in joined for t in ("نوع الخدمة", "type of service", "الخدمة المؤداة", "الخدمة")) or (
+    if any(t in joined for t in ("نوع الخدمة", "الخدمة المؤداة", "type of service")) or (
         "code" in joined and ("العضو" in joined or "member" in joined or "مشروع" in joined or "والدين" in joined)
     ):
+        # NOTE: bare 'الخدمة' is deliberately NOT a trigger — 'اسم الخدمة'
+        # (any service list) contains it and would mis-route simple
+        # name+serial tables into the syndicate parser
         kind = "syndicate"
         score += 5
     if "test id" in joined or ("test type" in joined and "test name" in joined) or (
@@ -100,6 +176,13 @@ def _header_score(row: list[str | None]) -> tuple[str, int]:
     ):
         kind = "simple_4"
         score += 4
+    # plain name + value fee sheets (e.g. داخلي examination lists):
+    # a value/price column beside a service column, with no code/member markers
+    if kind == "generic" and any(t in joined for t in ("القيمه", "القيمة", "سعر", "price")) and any(
+        t in joined for t in ("الخدمة", "البيان", "اسم", "service")
+    ) and not any(t in joined for t in ("كود", "code", "العضو", "member", "والدين")):
+        kind = "simple_4"
+        score += 3
     if any(t in joined for t in ("price", "سعر", "قيمة", "القيمه")) and any(
         t in joined for t in ("name", "اسم", "أسم", "test", "خدمة")
     ):
@@ -121,16 +204,15 @@ def _is_priceish(cell) -> bool:
 # Syndicate parser
 # ---------------------------------------------------------------------------
 def _parse_syndicate_table(table: list[list[str | None]], page_no: int, rows: list[RawRow]) -> None:
-    header = [_fix_cell(_cell_str(c)) or "" for c in table[0]]
+    header = [_header_cell(c) for c in table[0]]
     ncols = max(len(r) for r in table if r)
     col_map: dict[str, int] = {}
-    for i, t in enumerate(header):
-        tl = t.lower()
-        if "code" in tl or "كود" in t:
-            col_map["code"] = i
-        elif any(x in t for x in ("نوع الخدمة", "الخدمة", "name", "البيان", "المؤداة")):
-            col_map["name"] = i
-        elif "العضو" in t and "مشروع" not in t and "والدين" not in t:
+    for i, c in enumerate(table[0]):
+        if _header_has(c, "code", "كود"):
+            col_map.setdefault("code", i)
+        elif _header_has(c, "نوع الخدمة", "الخدمة", "name", "البيان", "المؤداة"):
+            col_map.setdefault("name", i)
+        elif _header_has(c, "العضو") and not _header_has(c, "مشروع", "والدين"):
             col_map.setdefault("member", i)
     # If header is the visual-order mess, use positional fallback based on x-order
     # pdfplumber left→right: 40% | 60% | 50% | 50% | member | name | code
@@ -166,6 +248,18 @@ def _parse_syndicate_table(table: list[list[str | None]], page_no: int, rows: li
             price_cols.append(i)
     price_cols.sort()
 
+    # Structural guard: a real syndicate list has a code column and several
+    # numeric share/price columns. A plain name+serial 2-column table that
+    # merely mentioned 'الخدمة' is not one — let the generic parser handle it
+    # so its serial-run detection keeps row numbers out of the prices.
+    if "code" not in col_map and len(price_cols) < 3 and not any(
+        re.search(r"\d+\s*[%٪]", t)
+        for c in table[0]
+        for t in _header_texts(c)
+    ):
+        _parse_generic(table, page_no, rows)
+        return
+
     # Category names from header row / second row
     # Default syndicate mapping (Cairo 2026 radiology / labs / clinics):
     # leftmost → parents_project_40, then parents_project_60,
@@ -179,34 +273,78 @@ def _parse_syndicate_table(table: list[list[str | None]], page_no: int, rows: li
         "member_extra",
         "member_extra2",
     ]
+
+    def _header_cat_label(cell) -> str:
+        for t in _header_texts(cell):
+            if "40" in t:
+                return "parents_project_40"
+            if "60" in t:
+                return "parents_project_60"
+            if "50" in t:
+                return "member_share_50"
+            if "العضو" in t or "member" in t.lower():
+                return "member"
+            if "والدين" in t:
+                return "parents"
+            if "مشروع" in t:
+                return "project"
+        return ""
+
     # If 4 price cols: member, member_project_50, member_parents_50, parents
     # Detect from header percentages
     header_texts = header
-    cats: list[str] = []
-    for t in header_texts:
-        if not t:
-            cats.append("")
-            continue
-        if "40" in t:
-            cats.append("parents_project_40")
-        elif "60" in t:
-            cats.append("parents_project_60")
-        elif "50" in t:
-            cats.append("member_share_50")
-        elif "العضو" in t or "member" in t.lower():
-            cats.append("member")
-        elif "والدين" in t:
-            cats.append("parents")
-        elif "مشروع" in t:
-            cats.append("project")
-        else:
-            cats.append("")
+    cats: list[str] = [_header_cat_label(c) for c in table[0]]
 
     # Build a better cat list for price_cols
-    pct_cols = []
-    for i, t in enumerate(header_texts):
-        if re.search(r"\d+\s*%", t):
-            pct_cols.append(i)
+    #
+    # Layout truth (verified against أشعة / تحاليل / عيادات 2026 lists):
+    # the FULL member price is always the RIGHTMOST numeric column; the
+    # columns before it are share percentages (40% / 60% / 50% / 50%).
+    # RTL extraction misaligns scheme labels ('الوالدين', 'العضو وأسرته')
+    # onto the wrong columns, so plain text labels must never decide the
+    # category here — percentages and position only. In particular a share
+    # column labelled 'العضو' is still a 50% share, not the full price.
+    member_col = price_cols[-1] if price_cols else None
+    col_cat: dict[int, str] = {}
+    fifty_seen = False
+    for pi, col in enumerate(price_cols):
+        if col == member_col:
+            col_cat[col] = "member"
+            continue
+        pct = None
+        for hrow in table[:3]:
+            if col < len(hrow):
+                for t in _header_texts(hrow[col]):
+                    m = re.search(r"(\d+)\s*[%٪]", t)
+                    if m:
+                        pct = m.group(1)
+                        break
+                if pct:
+                    break
+        if pct == "40":
+            col_cat[col] = "parents_project_40"
+        elif pct == "60":
+            col_cat[col] = "parents_project_60"
+        elif pct == "50":
+            col_cat[col] = "member_parents_50" if not fifty_seen else "member_project_50"
+            fifty_seen = True
+        elif pct:
+            col_cat[col] = f"member_share_{pct}"
+        else:
+            # a genuine price-label word (القيمة / سعر / price) may name the
+            # column — but scheme words (الوالدين / العضو / مشروع) misalign in
+            # RTL extraction and must never pick the category
+            label_cat = None
+            if col < len(cats) and cats[col]:
+                mc = map_price_category(cats[col])
+                if mc == "cash":
+                    label_cat = mc
+            if label_cat:
+                col_cat[col] = label_cat
+            elif pi < len(default_cats) and default_cats[pi] != "member":
+                col_cat[col] = default_cats[pi]
+            else:
+                col_cat[col] = f"price_{pi + 1}"
 
     for r_idx, row in enumerate(table[1:], start=2):
         if not row:
@@ -228,25 +366,11 @@ def _parse_syndicate_table(table: list[list[str | None]], page_no: int, rows: li
         prices: list[RawPrice] = []
         for pi, col in enumerate(price_cols):
             val = parse_number(row[col] if col < len(row) else None)
-            if val is None:
+            if val is None or val <= 0:
+                # 0 in these lists marks a scheme that does not cover the
+                # service (e.g. psychiatric care for parents) — not a price
                 continue
-            ht = header_texts[col] if col < len(header_texts) else ""
-            if re.search(r"\d+\s*%", ht):
-                if re.search(r"40\s*%", ht):
-                    cat = "parents_project_40"
-                elif re.search(r"60\s*%", ht):
-                    cat = "parents_project_60"
-                else:
-                    fifty_left = [j for j, t2 in enumerate(header_texts) if re.search(r"50\s*%", t2)]
-                    cat = "member_parents_50" if (fifty_left and col == fifty_left[0]) else "member_project_50"
-            elif cats[col]:
-                # Header evidence beats positional guessing: the label in the
-                # source column is the only reliable statement of what it is.
-                cat = map_price_category(cats[col])
-            elif pi < len(default_cats):
-                cat = default_cats[pi]
-            else:
-                cat = f"price_{pi + 1}"
+            cat = col_cat.get(col) or f"price_{pi + 1}"
             prices.append(RawPrice(value=val, category=cat, currency="EGP"))
 
         if not name:
@@ -285,26 +409,27 @@ def _parse_syndicate_table(table: list[list[str | None]], page_no: int, rows: li
 # Lab list parser
 # ---------------------------------------------------------------------------
 def _parse_lab_table(table: list[list[str | None]], page_no: int, rows: list[RawRow], title_hint: str | None) -> None:
-    header = [_fix_cell(_cell_str(c) or "") or "" for c in table[0]]
+    header = table[0]
     idx = {"type": None, "id": None, "cat": None, "name": None, "price": None}
     for i, h in enumerate(header):
-        hl = h.lower()
-        if "test type" in hl or hl == "type":
+        if _header_has(h, "test type") or _header_has(h, "type") and len(_header_cell(h)) <= 6:
             idx["type"] = i
-        elif "test id" in hl or hl == "id":
+        elif _header_has(h, "test id") or _header_cell(h).lower() == "id":
             idx["id"] = i
-        elif "category" in hl:
+        elif _header_has(h, "category"):
             idx["cat"] = i
-        elif "test name" in hl or "object name" in hl or "name" in hl:
+        elif _header_has(h, "test name", "object name", "name"):
             idx["name"] = i
-        elif "price" in hl:
+        elif _header_has(h, "price"):
             idx["price"] = i
     if idx["name"] is None:
         return
     for row in table[1:]:
         if not row:
             continue
-        name = clean_service_name(_cell_str(row[idx["name"]]) if idx["name"] < len(row) else None)
+        # Data cells need the same RTL repair as headers, otherwise Arabic
+        # test names stay in visual order and never match the catalog.
+        name = clean_service_name(_fix_cell(_cell_str(row[idx["name"]])) if idx["name"] < len(row) else None)
         if not name:
             continue
         price = None
@@ -334,7 +459,7 @@ def _parse_lab_table(table: list[list[str | None]], page_no: int, rows: list[Raw
 # Simple 4-col (Kasr Al Ainy / generic hospital lists)
 # ---------------------------------------------------------------------------
 def _parse_simple4(table: list[list[str | None]], page_no: int, rows: list[RawRow]) -> None:
-    header = [_fix_cell(_cell_str(c) or "") or "" for c in table[0]]
+    header = [_header_cell(c) for c in table[0]]
     # Try: serial | code | name | price  (RTL: price is leftmost in visual, but
     # pdfplumber already returns left→right so price may be first)
     # Detect by content of first data row.
@@ -350,21 +475,21 @@ def _parse_simple4(table: list[list[str | None]], page_no: int, rows: list[RawRo
         if parse_number(s) is not None and ("." in s or re.fullmatch(r"\d{2,6}", s.replace(",", ""))):
             if price_i is None and not looks_like_code(s):
                 price_i = i
-    for i, h in enumerate(header):
-        hl = h.lower()
-        if any(x in hl for x in ("أسم الخدمة", "اسم الخدمة", "name")):
+    for i, c in enumerate(table[0]):
+        if _header_has(c, "أسم الخدمة", "اسم الخدمة", "اسم الخدمه", "name"):
             name_i = i
-        if "كود" in hl or "code" in hl:
+        if _header_has(c, "كود", "code"):
             code_i = i
-        if any(x in hl for x in ("القيمه", "القيمة", "price")):
+        if _header_has(c, "القيمه", "القيمة", "price"):
             price_i = i
     if name_i is None:
-        # pick the longest text column
+        # pick the longest text column; on ties prefer the rightmost, since
+        # RTL tables place the service name on the right (high pdfplumber index)
         best, bi = 0, None
         for i in range(len(header)):
             texts = [(_cell_str(r[i]) if i < len(r) else "") or "" for r in table[1:6]]
             alpha = sum(1 for t in texts if len(t) > 8)
-            if alpha > best:
+            if alpha >= best:
                 best, bi = alpha, i
         name_i = bi
     if name_i is None:
@@ -372,7 +497,7 @@ def _parse_simple4(table: list[list[str | None]], page_no: int, rows: list[RawRo
     for row in table[1:]:
         if not row:
             continue
-        name = clean_service_name(_cell_str(row[name_i]) if name_i < len(row) else None)
+        name = clean_service_name(_fix_cell(_cell_str(row[name_i])) if name_i < len(row) else None)
         if not name:
             continue
         if len(name) < 4:
@@ -405,6 +530,47 @@ def _parse_simple4(table: list[list[str | None]], page_no: int, rows: list[RawRo
 # ---------------------------------------------------------------------------
 # Generic table
 # ---------------------------------------------------------------------------
+def _looks_like_serial(values: list[str]) -> bool:
+    """True when numeric cells form increasing near-consecutive run(s) —
+    the signature of a serial / code column, not prices.
+
+    Handles columns with several RESTARTED runs (1..7, then 1..3) produced by
+    multi-block package tables, and scrambled single runs from RTL cell order.
+    """
+    nums = [parse_number(v) for v in values]
+    nums = [n for n in nums if n is not None]
+    if len(nums) < 3 or any(n < 1 or n != int(n) for n in nums):
+        return False
+    # in-order maximal ascending-by-1 runs; restarts begin new runs
+    runs: list[list[float]] = []
+    for n in nums:
+        if runs and n == runs[-1][-1] + 1:
+            runs[-1].append(n)
+        else:
+            runs.append([n])
+    in_run = sum(len(r) for r in runs if len(r) >= 2)
+    longest = max(len(r) for r in runs)
+    restarted = any(i > 0 and runs[i][0] == 1 for i in range(len(runs)))
+    if longest >= 3 and (in_run >= 0.7 * len(nums) or restarted):
+        return True
+    # scrambled single run (RTL cell order): sorted values near-consecutive
+    s = sorted(nums)
+    if len(set(s)) == len(s):
+        gaps = [b - a for a, b in zip(s, s[1:])]
+        if sum(1 for g in gaps if g == 1) >= max(1, len(gaps) - 1):
+            return True
+    # interleaved serials: 3-pair package layouts split 1..N across columns
+    # as 1,4,7… / 2,5,8… / 3,6,9… — strictly ascending, constant small step,
+    # small values. Real price columns never look like this.
+    if len(nums) >= 3 and all(n <= 60 for n in nums):
+        steps = {b - a for a, b in zip(nums, nums[1:])}
+        if len(steps) == 1:
+            g = next(iter(steps))
+            if 1 <= g <= 3 and all(b > a for a, b in zip(nums, nums[1:])):
+                return True
+    return False
+
+
 def _parse_generic(table: list[list[str | None]], page_no: int, rows: list[RawRow]) -> None:
     if len(table) < 2:
         return
@@ -418,23 +584,100 @@ def _parse_generic(table: list[list[str | None]], page_no: int, rows: list[RawRo
             s = _cell_str(row[i]) if i < len(row) else None
             if not s:
                 continue
+            # count numeric and code evidence independently: a plain "460"
+            # is both code-shaped and a perfectly valid price
+            if parse_number(s) is not None:
+                num_scores[i] += 1
             if looks_like_code(s):
                 code_scores[i] += 1
-            elif parse_number(s) is not None:
-                num_scores[i] += 1
-            elif len(s) >= 4:
+            if parse_number(s) is None and not looks_like_code(s) and len(s) >= 4:
                 text_scores[i] += 1
-    name_i = max(range(ncols), key=lambda i: text_scores[i]) if any(text_scores) else None
+    name_i = max(range(ncols), key=lambda i: (text_scores[i], i)) if any(text_scores) else None
     if name_i is None or text_scores[name_i] < 2:
         return
-    price_cols = [i for i in range(ncols) if num_scores[i] >= 2 and i != name_i and code_scores[i] < num_scores[i]]
-    code_i = max(range(ncols), key=lambda i: code_scores[i]) if any(code_scores) else None
-    if code_i is not None and code_scores[code_i] < 2:
-        code_i = None
 
-    header = [_fix_cell(_cell_str(c) or "") or "" for c in table[0]]
+    header = table[0]
+    # RTL tables put the service name on the right (high pdfplumber index);
+    # a serial marker header (م / مسلسل / رقم / #) marks a row-number column
+    # that must never be read as prices.
+    serial_headers = {"م", "#", "مسلسل", "رقم", "s.", "s no", "م/"}
+    serial_cols = {
+        i for i, c in enumerate(header)
+        if (_header_cell(c).strip().lower() in serial_headers or _header_cell(c).strip() in serial_headers)
+    }
+    header_code_i = None
+    for i, c in enumerate(header):
+        if _header_has(c, "كود", "code"):
+            header_code_i = i
+            break
+
+    numeric_cols = [
+        i for i in range(ncols)
+        if num_scores[i] >= 2 and i != name_i and i not in serial_cols
+    ]
+    code_like_cols = [i for i in numeric_cols if code_scores[i] == num_scores[i]]
+    # alphanumeric code columns (LAB-001) are code-shaped but not numeric
+    alpha_code_cols = [
+        i for i in range(ncols)
+        if i != name_i and code_scores[i] >= 2 and num_scores[i] == 0
+    ]
+    free_price_cols = [i for i in numeric_cols if i not in code_like_cols]
+
+    def _serial_cols(cols: list[int]) -> list[int]:
+        return [
+            i for i in cols
+            if _looks_like_serial([_cell_str(r[i]) for r in table[1:] if i < len(r)])
+        ]
+
+    code_i = None
+    code_candidates = code_like_cols + alpha_code_cols
+    # every serial-run numeric column is a row-number/code column — with the
+    # multi-block fee tables there can be several (one per component pair),
+    # and only excluding ALL of them keeps codes out of the prices
+    serial_cols_detected = _serial_cols(numeric_cols)
+    code_cols = set(serial_cols_detected)
+    if header_code_i is not None and header_code_i in code_candidates:
+        code_i = header_code_i
+    else:
+        if serial_cols_detected:
+            code_i = serial_cols_detected[0]
+        elif len(numeric_cols) >= 2 and len(code_candidates) == 1:
+            # with several numeric columns, the lone code-shaped one is the code
+            code_i = code_candidates[0]
+        elif len(numeric_cols) == 1 and alpha_code_cols:
+            # a lone integer column beside an alphanumeric code column is a price
+            code_i = alpha_code_cols[0]
+        # a single integer column with no corroborating evidence is kept as a
+        # price: a list with one numeric column is far more often the tariff
+    if code_i is not None:
+        code_cols.add(code_i)
+
+    # 3-pair package layouts (e.g. لائحة pages 71/76/77): an early row carries
+    # bare 'م' (مسلسل) markers above the serial columns. Any small-integer
+    # column under such a marker is a row-number column, never a price.
+    pair_marker_cols = {
+        i for r in table[:2] for i, c in enumerate(r)
+        if c and _fix_cell(_cell_str(c)).strip() in ("م", "مسلسل", "لسلسم")
+    }
+    if pair_marker_cols:
+        for i in numeric_cols:
+            vals = [
+                v for v in (parse_number(_cell_str(row[i])) for row in table[1:])
+                if v is not None
+            ]
+            if vals and all(v <= 60 for v in vals):
+                code_cols.add(i)
+
+    price_cols = [i for i in numeric_cols if i not in code_cols]
+    if not free_price_cols and not serial_cols_detected and len(numeric_cols) > 1:
+        # Ambiguous all-integer table with no header hint: drop serial-looking
+        # columns from the prices rather than ingest row numbers as tariffs.
+        price_cols = [i for i in price_cols if i not in _serial_cols(price_cols)]
+        if not price_cols:
+            price_cols = numeric_cols[-1:]
+
     for row in table[1:]:
-        name = clean_service_name(_cell_str(row[name_i]) if name_i < len(row) else None)
+        name = clean_service_name(_fix_cell(_cell_str(row[name_i])) if name_i < len(row) else None)
         if not name or len(name) < 3:
             continue
         prices = []
@@ -442,7 +685,17 @@ def _parse_generic(table: list[list[str | None]], page_no: int, rows: list[RawRo
             v = parse_number(row[i] if i < len(row) else None)
             if v is None:
                 continue
-            cat = map_price_category(header[i] if i < len(header) else None)
+            cat = "unspecified"
+            for t in _header_texts(header[i] if i < len(header) else None):
+                # a numeric "header" cell means the table is a headerless
+                # continuation block (row 0 is data): the column is a plain
+                # fee column, and the number was the previous row's price
+                if parse_number(t) is not None:
+                    cat = "cash"
+                    break
+                cat = map_price_category(t)
+                if cat != "unspecified":
+                    break
             prices.append(RawPrice(value=v, category=cat, currency="EGP"))
         if not prices:
             continue
@@ -654,6 +907,12 @@ def parse_pdf(path: Path) -> ParsedDoc:
             org_hint = "مستشفى قصر العينى التعليمى الجديد"
             provider_hint = org_hint
             city_hint = "القاهرة"
+        if "المؤسسة العلاجية" in t or "العلاجية" in t or "العلاجيه" in t:
+            # the Therapeutic Institution publishes its own tariff; do not let
+            # another hint (e.g. قصر العينى) swallow it when both appear
+            org_hint = None
+            provider_hint = "المؤسسة العلاجية"
+            city_hint = city_hint or "القاهرة"
         if "نقابة" in t or "النقابة" in t or "CODE" in t[:200]:
             org_hint = org_hint or "نقابة الأطباء المصرية"
         year_m = re.search(r"(20\d{2})", t)
@@ -697,6 +956,11 @@ def parse_pdf(path: Path) -> ParsedDoc:
             except Exception as e:
                 warnings.append(f"page {pi}: table extract failed: {e}")
                 continue
+            if _page_text_garbled(page):
+                # broken-font page: re-read with MuPDF for correct glyphs
+                mt = _mupdf_tables(str(path), pi - 1)
+                if mt:
+                    tables = mt
             if not tables:
                 continue
             # per-page layout refine
@@ -706,9 +970,40 @@ def parse_pdf(path: Path) -> ParsedDoc:
                 if len(table) < 2:
                     continue
                 if component_mode:
+                    # Component mode is document-level, but a table with an
+                    # explicit price/value header is a real price list (e.g. the
+                    # examination-fee page of the داخلي file). Parse it as one;
+                    # fall back to component parsing if that yields nothing.
+                    joined = " | ".join(
+                        t.lower() for c in table[0] for t in _header_texts(c)
+                    )
+                    has_price_col = any(x in joined for x in ("price", "سعر", "قيمة", "القيمه", "الاجمالي"))
+                    has_name_col = any(x in joined for x in ("اسم", "الخدمة", "خدمة", "name", "البيان"))
+                    if has_price_col and has_name_col:
+                        before = len(rows)
+                        if any(x in joined for x in ("العضو", "member", "والدين", "مشروع", "كود", "code")):
+                            # syndicate-style columns → keep the page layout
+                            if use == "syndicate":
+                                _parse_syndicate_table(table, pi, rows)
+                            elif use == "lab_list":
+                                _parse_lab_table(table, pi, rows, title)
+                            else:
+                                _parse_simple4(table, pi, rows)
+                        else:
+                            # plain name + value fee sheet → cash prices
+                            _parse_simple4(table, pi, rows)
+                        if len(rows) > before:
+                            continue
                     _parse_component_table(table, pi, rows)
                     continue
                 before = len(rows)
+                if _is_component_table(table[0]):
+                    # per-table guard: a component breakdown table (surgeon /
+                    # anesthesia / assistants / OR room columns) must never be
+                    # read as a price list, even in a mostly-price document
+                    _parse_component_table(table, pi, rows)
+                    if len(rows) > before:
+                        continue
                 if use == "syndicate":
                     _parse_syndicate_table(table, pi, rows)
                 elif use == "lab_list":

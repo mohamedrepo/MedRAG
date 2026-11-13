@@ -73,9 +73,22 @@ class IngestionPipeline:
     ) -> Provider | None:
         if not name:
             return None
-        name = name.strip()
+        name = " ".join(name.split())
+        # tolerant lookup: several re-ingests can leave same-name provider
+        # rows behind; scalar_one_or_none would raise MultipleResultsFound.
+        # Stored branch_name is often NULL — comparing it to '' never matches
+        # in SQL, so treat NULL and '' as the same empty branch.
+        branch = branch_name or ""
+        branch_filter = (
+            Provider.branch_name == branch
+            if branch
+            else Provider.branch_name.is_(None) | (Provider.branch_name == "")
+        )
         prov = self.db.execute(
-            select(Provider).where(Provider.name == name, Provider.branch_name == (branch_name or ""))
+            select(Provider)
+            .where(Provider.name == name, branch_filter)
+            .order_by(Provider.created_at)
+            .limit(1)
         ).scalar_one_or_none()
         if not prov:
             prov = Provider(
@@ -186,7 +199,7 @@ class IngestionPipeline:
         return "hospital"
 
     # ------------------------------------------------------------------
-    def persist_rows(self, doc: SourceDocument, parsed: ParsedDoc, provider: Provider | None, org: Organization | None) -> dict[str, Any]:
+    def persist_rows(self, doc: SourceDocument, parsed: ParsedDoc, provider: Provider | None, org: Organization | None) -> tuple[dict[str, Any], list[dict]]:
         tariff = Tariff(
             provider_id=provider.id if provider else None,
             organization_id=org.id if org else None,
@@ -291,13 +304,31 @@ class IngestionPipeline:
                 exam.embedding = pack_vector(self.embedder.embed_one(f"{exam.name_en} {exam.name_ar} {name}"))
                 exam.embedding_model = self.embedder.name
                 stats["new_examinations"] += 1
-                res_strategy = "new_from_source"
                 # proposed alias so the admin can merge later
                 self.xref.propose_alias(
                     name, exam.id, source_document_id=doc.id, source_page=raw.page,
                     confidence=0.6, auto_approve=False,
                 )
                 stats["proposed_aliases"] += 1
+                # resolve() had candidates but rejected them (score or attribute
+                # conflict). Surface the best one instead of silently growing a
+                # near-duplicate canonical exam.
+                strong = [c for c in (res.candidates or []) if c.get("score", 0) >= 0.75]
+                if strong:
+                    self._queue_review(
+                        "examination", exam.id, "possible_duplicate",
+                        {
+                            "source_name": name,
+                            "candidate_id": strong[0]["id"],
+                            "candidate_code": strong[0].get("code"),
+                            "candidate_name_en": strong[0].get("name_en"),
+                            "candidate_score": strong[0].get("score"),
+                            "attrs_ok": strong[0].get("attrs_ok"),
+                            "page": raw.page,
+                        },
+                        priority=3,
+                    )
+                    stats["needs_review"] += 1
 
             # Alias
             alias_conf = 0.9 if res.strategy in ("exact_alias", "collapsed_alias", "canonical_name", "acronym") else 0.65
@@ -372,15 +403,16 @@ class IngestionPipeline:
         # same exam, same provider, wildly different prices
         from sqlalchemy import func
         rows = self.db.execute(
-            select(PriceRecord.examination_id, PriceValue.value)
+            select(PriceRecord.id, PriceRecord.examination_id, PriceValue.value)
             .join(PriceValue, PriceValue.price_record_id == PriceRecord.id)
             .where(PriceRecord.tariff_id == tariff.id)
         ).all()
-        by_exam: dict[str, list[float]] = {}
-        for eid, val in rows:
+        by_exam: dict[str, list[tuple[str, float]]] = {}
+        for rec_id, eid, val in rows:
             if eid and val is not None:
-                by_exam.setdefault(eid, []).append(float(val))
-        for eid, vals in by_exam.items():
+                by_exam.setdefault(eid, []).append((rec_id, float(val)))
+        for eid, pairs in by_exam.items():
+            vals = [v for _, v in pairs]
             if len(vals) >= 2:
                 lo, hi = min(vals), max(vals)
                 if lo > 0 and hi / lo >= 8:
@@ -390,10 +422,14 @@ class IngestionPipeline:
                         "min": lo,
                         "max": hi,
                     })
-                    self._queue_review(
-                        "price_record", eid, "conflicting_prices",
-                        {"min": lo, "max": hi}, priority=2,
-                    )
+                    # one review item per affected price record so the queue
+                    # links to something actionable (entity_type matches entity_id)
+                    for rec_id, val in pairs:
+                        self._queue_review(
+                            "price_record", rec_id, "conflicting_prices",
+                            {"examination_id": eid, "min": lo, "max": hi, "value": val},
+                            priority=2,
+                        )
 
     def _queue_review(self, entity_type: str, entity_id: str, reason: str, detail: dict | None, priority: int = 5) -> None:
         self.db.add(ReviewItem(

@@ -36,6 +36,7 @@ from app.schemas import (
     TokenOut,
 )
 from app.search import SearchEngine
+from app.normalization import normalize_query
 from app.security import (
     audit,
     create_access_token,
@@ -107,18 +108,23 @@ def search(
 ):
     eng = SearchEngine(db)
     if group:
-        return eng.compare(
+        data = eng.compare(
             q, price_category=price_category, year=year, category=category,
             city=city, governorate=governorate, provider_id=provider_id,
             effective_only=effective_only, include_variants=include_variants,
             limit=limit, offset=offset,
         )
-    return eng.search(
-        q, category=category, city=city, governorate=governorate,
-        provider_id=provider_id, price_category=price_category, year=year,
-        effective_only=effective_only, include_variants=include_variants,
-        limit=limit, offset=offset,
-    )
+    else:
+        data = eng.search(
+            q, category=category, city=city, governorate=governorate,
+            provider_id=provider_id, price_category=price_category, year=year,
+            effective_only=effective_only, include_variants=include_variants,
+            limit=limit, offset=offset,
+        )
+    # persist the resolution cache written by xref.resolve (read-only API, but
+    # the cache is the point of it — without this every search recomputes)
+    db.commit()
+    return data
 
 
 @search_r.get("/suggest")
@@ -134,7 +140,7 @@ def resolve(body: ResolveIn, db: Session = Depends(get_db)):
         r = xref.resolve(name)
         out.append({
             "query": name,
-            "normalized": name and __import__("app.normalization", fromlist=["normalize_query"]).normalize_query(name),
+            "normalized": normalize_query(name) if name else "",
             "matched": bool(r.examination),
             "canonical_code": r.examination.canonical_code if r.examination else None,
             "canonical_en": r.examination.name_en if r.examination else None,
@@ -188,7 +194,7 @@ def list_examinations(
 ):
     conds = [Examination.status == "active"]
     if q:
-        nq = __import__("app.normalization", fromlist=["normalize_query"]).normalize_query(q)
+        nq = normalize_query(q)
         conds.append(
             or_(
                 Examination.name_en.ilike(f"%{q}%"),
@@ -409,7 +415,10 @@ async def upload_document(
     # basic magic-byte check
     _validate_magic(tmp, ext)
     pipe = IngestionPipeline(db)
-    result = pipe.ingest_file(tmp, original_filename=file.filename)
+    try:
+        result = pipe.ingest_file(tmp, original_filename=file.filename)
+    finally:
+        tmp.unlink(missing_ok=True)
     audit(db, None, user, "document.upload", "document", result.get("document_id"),
           new_value={"filename": file.filename, "result_summary": {k: result.get(k) for k in ("duplicate", "parser", "stats")}})
     db.commit()
@@ -417,7 +426,8 @@ async def upload_document(
 
 
 def _validate_magic(path: Path, ext: str) -> None:
-    head = path.open("rb").read(16)
+    with path.open("rb") as fh:
+        head = fh.read(16)
     sigs = {
         b"%PDF": "pdf",
         b"PK\x03\x04": {"xlsx", "docx", "pptx"},

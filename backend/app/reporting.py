@@ -14,10 +14,17 @@ from app.models import PriceValue, Provider
 
 # Centre name == folder name on disk.
 SYNDICATE_2026 = "نقابة الاطباء 2026"
+# The syndicate's 2026 أشعة/تحاليل lists sit byte-identical in three folders;
+# each folder is a centre reporting the same member prices.
+SYNDICATE_2026_CENTRES = (
+    "مركز الطاهرة",
+    "مركز النيل للاشعه",
+)
 
 # centre name -> categories that may be reported for that centre
 REPORTED_CATEGORIES: dict[str, frozenset[str]] = {
     SYNDICATE_2026: frozenset({"member"}),
+    **{name: frozenset({"member"}) for name in SYNDICATE_2026_CENTRES},
 }
 
 # Human-facing label for a centre whose folder is the syndicate's.

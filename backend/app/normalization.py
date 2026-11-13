@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Character classes
@@ -207,8 +208,18 @@ STOPWORDS_AR = {
 
 # Tokens that alone must not drive a merge (Vitamin A vs Vitamin D).
 GENERIC_FAMILY_TOKENS = {
-    "vitamin", "vit", "فيامين", "فيتامين", "هرمون", "hormone",
+    "vitamin", "vit", "فيتامين", "فيامين", "هرمون", "hormone",
     "total", "free", "serum", "blood", "urine",
+    # imaging modalities — sharing 'أشعة' / 'CT' does not make two services
+    # the same exam; a distinctive non-modality token is required to merge
+    "x", "ray", "xray", "ct", "mri", "ultrasound", "echo", "sonar",
+    "doppler", "duplex", "plain", "اشعه", "مقطعيه", "رنين", "مغناطيس", "سونار",
+    "ايكو", "موجات", "صوتيه", "دوبلر", "دوبلكس", "شرايين", "صدى",
+    # assay-class words: sharing an isotype / specimen word / numeric ratio
+    # does not make two tests the same analyte
+    "igg", "igm", "iga", "ige", "antibodies", "antibody", "acid",
+    "factor", "ratio", "creatinine", "hrs", "hour", "hours",
+    "dna", "rna", "pcr",
 }
 
 
@@ -224,11 +235,10 @@ class NormalizedTerm:
     def __post_init__(self) -> None:
         self.tokens = self.normalized.split() if self.normalized else []
         compact = self.collapsed.replace(" ", "")
+        single_token = len(self.tokens) == 1 and self.normalized == compact
         self.is_acronym = (
-            len(compact) <= 8
-            and compact.isalpha()
-            and self.normalized.replace(" ", "") != compact
-            or (len(compact) <= 6 and self.normalized == compact and compact.isalpha() and len(self.tokens) == 1)
+            (len(compact) <= 8 and compact.isalpha() and self.normalized.replace(" ", "") != compact)
+            or (len(compact) <= 6 and single_token and compact.isalpha())
         )
 
 
@@ -343,16 +353,15 @@ LATERALITY = {
 def extract_attributes(name: str) -> dict[str, Any]:
     """Pull contrast / views / laterality so we never merge distinct variants."""
     s = normalize_query(name)
+    ar = normalize_arabic(name)
     attrs: dict[str, Any] = {}
-    if any(h in s or h in normalize_arabic(name) for h in ("with contrast", "بالصبغة", "صبغة", "contrast")):
-        if "without" in s or "بدون" in normalize_arabic(name) or "غير" in name:
-            attrs["contrast"] = "without"
-        elif "contrast" in s or "صبغ" in name or "بالصبغة" in name:
-            attrs["contrast"] = "with"
-    if "بدون صبغة" in name or "without contrast" in s:
-        attrs["contrast"] = "without"
-    if "بالصبغة" in name or "with contrast" in s:
-        attrs["contrast"] = "with"
+
+    # Contrast: explicit mention wins; "without" beats "with" when both appear.
+    mentions_contrast = (
+        "contrast" in s or "صبغ" in ar or "صبغ" in name
+    )
+    if mentions_contrast:
+        attrs["contrast"] = "without" if ("without" in s or "بدون" in ar or "غير" in ar) else "with"
 
     if any(v in s for v in ("two view", "2 view", "وضعين", "وضعان", "ap and lateral", "ap & lateral", "ap/lat", "pa and lateral")):
         attrs["views"] = 2
@@ -365,20 +374,38 @@ def extract_attributes(name: str) -> dict[str, Any]:
     elif re.search(r"\blat(er(al)?)?\b", s) and re.search(r"\bap\b", s):
         attrs["views"] = 2
 
-    low = name.lower()
+    # Word-boundary match for English laterality so "upright" / "cleft"
+    # are not read as right / left.
     if "bilateral" in s or "الجهتين" in name or "ثنائي" in name:
         attrs["laterality"] = "bilateral"
-    elif "right" in s or "يمين" in name:
+    elif re.search(r"\bright\b", s) or "يمين" in name:
         attrs["laterality"] = "right"
-    elif "left" in s or "يسار" in name:
+    elif re.search(r"\bleft\b", s) or "يسار" in name:
         attrs["laterality"] = "left"
+
+    # Modality: CT / MRI / ultrasound / X-ray must never cross-merge —
+    # 'أشعة على الجيوب' (X-ray) and 'أشعة مقطعية على الجيوب' (CT) are different
+    # services at very different prices. Check CT/MRI first: 'أشعة مقطعية'
+    # contains the generic 'أشعة' token.
+    if re.search(r"\bct\b|\bc t\b", s) or "مقطع" in ar or "مقطعية" in name:
+        attrs["modality"] = "ct"
+    elif re.search(r"\bmri\b|\bm r i\b|\bmra\b", s) or "رنين" in name or "مغناطيس" in name:
+        attrs["modality"] = "mri"
+    elif (re.search(r"\bultrasound\b|\bsonar\b|\bdoppler\b|\bduplex\b|\becho\b", s)
+          or "سونار" in name or "ايكو" in name or "دوبلر" in name or "دوبلكس" in name
+          or "موجات صوتية" in name or "صدى" in name):
+        attrs["modality"] = "ultrasound"
+    elif (re.search(r"\bx ray\b|\bxray\b|\bplain\b", s)
+          or "اشعه" in ar or "أشعة" in name or "قشرية" in name or "سينية" in name):
+        attrs["modality"] = "xray"
 
     if "quantitative" in s or "كمي" in name:
         attrs["quantification"] = "quantitative"
-    if "qualitative" in s or "نوعي" in name:
+    elif "qualitative" in s or "نوعي" in name:
         attrs["quantification"] = "qualitative"
-    if "differential" in s or "نوعي" in name:
-        attrs.setdefault("differential", True)
+    # Differential is its own concept (CBC with diff) — do not overload نوعي.
+    if "differential" in s or "افتراق" in name or "التفريق" in name or "مع فرق" in name:
+        attrs["differential"] = True
     return attrs
 
 
@@ -386,7 +413,7 @@ def attributes_compatible(a: dict | None, b: dict | None) -> bool:
     """False when the two variants must stay separate (contrast, views, side…)."""
     a = a or {}
     b = b or {}
-    keys = ("contrast", "views", "laterality", "quantification")
+    keys = ("contrast", "views", "laterality", "quantification", "modality")
     for k in keys:
         va, vb = a.get(k), b.get(k)
         if va is not None and vb is not None and va != vb:

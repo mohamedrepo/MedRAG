@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from app.normalization import fix_rtl_visual_order, has_arabic, normalize_whitespace
+from app.normalization import has_arabic, normalize_whitespace
 
 
 @dataclass
@@ -101,21 +101,43 @@ PRICE_CAT_SYNONYMS = {
     "ثانيه مميز": "second_class",
     "ثانية مميز": "second_class",
     "ثانيه": "second_class",
+    # generic price-column headers found in hospital lists
+    "القيمة": "cash",
+    "القيمه": "cash",
+    "سعر": "cash",
+    "price": "cash",
+    # Compound syndicate/project categories — these must be checked before the
+    # short keys above, otherwise "member_project_50" collapses to "member"
+    # and the 50% share distinction is lost.
+    "member_share_50": "member_share_50",
+    "member_project_50": "member_project_50",
+    "member_parents_50": "member_parents_50",
+    "parents_project_40": "parents_project_40",
+    "parents_project_60": "parents_project_60",
+    "package_total": "package_total",
 }
+
+# Longest keys first so "member_project_50" wins over "member".
+_SYNONYM_KEYS_BY_LEN = sorted(
+    ((k, v) for k, v in PRICE_CAT_SYNONYMS.items() if k),
+    key=lambda kv: len(kv[0]),
+    reverse=True,
+)
 
 
 def map_price_category(label: str | None) -> str:
     if not label:
         return "unspecified"
     s = label.strip().lower()
+    s = s.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
     s = re.sub(r"\s+", " ", s)
     if s in PRICE_CAT_SYNONYMS:
         return PRICE_CAT_SYNONYMS[s]
-    for k, v in PRICE_CAT_SYNONYMS.items():
-        if k and k in s:
+    for k, v in _SYNONYM_KEYS_BY_LEN:
+        if k in s:
             return v
-    # percentage project shares
-    m = re.search(r"(\d+)\s*%", s)
+    # percentage project shares (Latin % and Arabic ٪)
+    m = re.search(r"(\d+)\s*[%٪]", s)
     if m:
         return f"project_{m.group(1)}"
     return re.sub(r"[^a-z0-9\u0600-\u06ff]+", "_", s)[:60] or "unspecified"
@@ -152,11 +174,12 @@ def parse_number(raw: Any) -> float | None:
         else:
             s = s.replace(",", "")
     elif "," in s:
-        # 1,234 or 123,4? treat as thousands if pattern 1-3 digits then ,ddd
-        if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
-            s = s.replace(",", "")
-        else:
-            s = s.replace(",", "")
+        # 1,234 or 123,4 — both read as a plain number once commas are dropped
+        s = s.replace(",", "")
+    elif re.fullmatch(r"\d{1,3}\.\d{3}", s):
+        # European thousands dot: "1.250" means 1250, not 1.25.
+        # A 3-decimal fraction is not a valid EGP price (piastres = 2 decimals).
+        s = s.replace(".", "")
     try:
         v = float(s)
         if v != v or v in (float("inf"), float("-inf")):
@@ -180,6 +203,11 @@ def looks_like_code(s: str) -> bool:
     return False
 
 
+# Fee-note parentheticals duplicate the stored price (e.g. 'جنية 5000 شامل
+# اجر الطبيب') — they are notes, not part of the service name.
+_FEE_NOTE_RE = re.compile(r"جنيه?\s*\d+|شامل\s*(اجر|أجر|اجلر)")
+
+
 def clean_service_name(s: str | None) -> str | None:
     if not s:
         return None
@@ -189,11 +217,69 @@ def clean_service_name(s: str | None) -> str | None:
     # strip leading row numbers
     s = re.sub(r"^\s*\d{1,4}[\s\.\)]+", "", s)
     s = normalize_whitespace(s)
+    s = _fix_visual_parens(s)
     if len(s) < 2:
         return None
     if looks_like_code(s) and len(s) <= 8:
         return None
     return s
+
+
+def _fix_visual_parens(s: str) -> str:
+    """Repair RTL visual-order paren damage and drop fee-note tails.
+
+    Visual-order PDFs emit ')أ( ب' where the logical text is 'ب (أ)'. Also
+    strip parentheticals that merely restate the price (fee notes).
+    """
+    s = s.strip()
+    for _ in range(3):
+        m = re.match(r"^\)\s*([^()]{2,80})\(\s*(.+)$", s)
+        if m:
+            s = f"{m.group(2).strip()} ({m.group(1).strip()})"
+            continue
+        m = re.match(r"^\(([^()]{2,80})\)\s*(.+)$", s)
+        if m:
+            s = f"{m.group(2).strip()} ({m.group(1).strip()})"
+            continue
+        break
+
+    # mid-string visual damage ')أ(' → logical '(أ)' (same transform as the
+    # leading rule, applied in place); fee-note groups are dropped outright
+    def _visual_to_logical(m: re.Match) -> str:
+        inner = m.group(1).strip()
+        if _FEE_NOTE_RE.search(inner):
+            return " "
+        return f"({inner})"
+
+    s = re.sub(r"\)\s*([^()]{2,80})\(", _visual_to_logical, s)
+
+    def _drop_fee(m: re.Match) -> str:
+        inner = m.group(1)
+        return "" if _FEE_NOTE_RE.search(inner) else f" ({inner})"
+
+    s = re.sub(r"\(([^()]{2,80})\)", _drop_fee, s)
+    s = re.sub(r"\s{2,}", " ", s)
+    # drop empty paren pairs anywhere
+    s = re.sub(r"[\s]*\([\s\.]*\)[\s]*", " ", s).strip()
+
+    # Edge runs of pure paren/space/dot debris (visual-order leftovers like
+    # ') (' at an edge) are dropped only when the remainder keeps balanced
+    # parens — a balanced name always keeps its closing paren.
+    m = re.search(r"[\(\)\s\.]*[\(\)][\(\)\s\.]*$", s)
+    if m and (m.start() > 0 or len(m.group(0).strip()) > 0):
+        rest = s[: m.start()]
+        if rest.count("(") == rest.count(")"):
+            s = rest
+    m = re.match(r"^[\(\)\s\.]*[\(\)][\(\)\s\.]*(?=.)", s)
+    if m:
+        rest = s[m.end():]
+        if rest.count("(") == rest.count(")"):
+            s = rest
+    while s and s[-1] in " -–—:،,":
+        s = s[:-1].rstrip()
+    while s and s[0] in " -–—:،,":
+        s = s[1:].lstrip()
+    return s.strip()
 
 
 def split_name_bilingual(name: str) -> tuple[str | None, str | None]:

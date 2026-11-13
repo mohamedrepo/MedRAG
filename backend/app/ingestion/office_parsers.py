@@ -45,6 +45,12 @@ def _norm_label(s: str | None) -> str:
     return s
 
 
+def _looks_like_serial(values: list[str]) -> bool:
+    """Increasing near-consecutive integers (1,2,3…) — a row-number column."""
+    from app.ingestion.pdf_parsers import _looks_like_serial as _ser
+    return _ser(values)
+
+
 def parse_xlsx(path: Path) -> ParsedDoc:
     wb = openpyxl.load_workbook(str(path), data_only=True)
     rows: list[RawRow] = []
@@ -99,7 +105,7 @@ def parse_xlsx(path: Path) -> ParsedDoc:
             if "اجمالي" in labels or "إجمالي" in labels or "الاجمالي" in labels:
                 total_i = i
                 break
-            if row[0] and not parse_number(row[0]) and any(parse_number(c) is not None for c in row[1:]):
+            if row and row[0] and not parse_number(row[0]) and any(parse_number(c) is not None for c in row[1:]):
                 item_rows.append((i, row))
 
         proc_name = clean_service_name(sheet_title or sheet_name) or sheet_name
@@ -181,14 +187,19 @@ def _parse_excel_simple(grid: list[list], sheet: str, rows: list[RawRow], sheet_
     if name_i is None:
         return
     if price_i is None:
-        # first numeric column after name
+        # first numeric column after name that is not the code column and does
+        # not look like a serial run (1,2,3…), which would be row numbers
         for j in range(ncols):
-            if j == name_i:
+            if j == name_i or j == code_i:
                 continue
-            hits = sum(1 for i in range(min(15, len(grid))) if parse_number(grid[i][j] if j < len(grid[i]) else None) is not None)
-            if hits >= 3:
-                price_i = j
-                break
+            vals = [grid[i][j] if j < len(grid[i]) else None for i in range(min(15, len(grid)))]
+            hits = sum(1 for v in vals if parse_number(v) is not None)
+            if hits < 3:
+                continue
+            if _looks_like_serial([str(v) for v in vals if v is not None]):
+                continue
+            price_i = j
+            break
     for i, row in enumerate(grid):
         name = clean_service_name(str(row[name_i]) if name_i < len(row) and row[name_i] else None)
         if not name or len(name) < 4:
@@ -198,7 +209,11 @@ def _parse_excel_simple(grid: list[list], sheet: str, rows: list[RawRow], sheet_
         price = parse_number(row[price_i]) if price_i is not None and price_i < len(row) else None
         if price is None:
             continue
-        code = str(row[code_i]) if code_i is not None and code_i < len(row) and row[code_i] else None
+        code = None
+        if code_i is not None and code_i < len(row) and row[code_i] is not None:
+            code = str(row[code_i])
+            if code.endswith(".0") and code[:-2].isdigit():
+                code = code[:-2]  # Excel numeric cells arrive as 123.0
         ar, en = split_name_bilingual(name)
         rows.append(RawRow(
             name=name,

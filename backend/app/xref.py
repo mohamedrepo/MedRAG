@@ -31,6 +31,8 @@ from app.normalization import (
     collapse_separators,
     detect_language,
     extract_attributes,
+    fix_rtl_visual_order,
+    has_arabic,
     normalize_query,
     similar,
 )
@@ -61,16 +63,27 @@ class XRefEngine:
     # ------------------------------------------------------------------
     def warm(self) -> None:
         if self._alias_cache is None:
-            self._alias_cache = {}
+            alias_cache: dict[str, Examination] = {}
+            collapsed_cache: dict[str, Examination] = {}
             rows = self.db.execute(
                 select(ExaminationAlias).where(ExaminationAlias.approval_status == "approved")
             ).scalars().all()
             exams = {e.id: e for e in self.db.execute(select(Examination)).scalars().all()}
             for a in rows:
-                self._alias_cache.setdefault(a.normalized_alias, exams.get(a.examination_id))
-                coll = collapse_separators(a.original_alias)
-                self._collapsed_cache = self._collapsed_cache or {}
-                self._collapsed_cache.setdefault(coll, exams.get(a.examination_id))
+                e = exams.get(a.examination_id)
+                if e is None:
+                    continue
+                # follow merges; never resolve to retired/superseded exams
+                hops = 0
+                while e.status == "merged" and e.merged_into_id and hops < 5:
+                    e = exams.get(e.merged_into_id)
+                    hops += 1
+                if e is None or e.status != "active":
+                    continue
+                alias_cache.setdefault(a.normalized_alias, e)
+                collapsed_cache.setdefault(collapse_separators(a.original_alias), e)
+            self._alias_cache = alias_cache
+            self._collapsed_cache = collapsed_cache
 
     def _exams(self) -> list[Examination]:
         if self._exam_list is None:
@@ -85,7 +98,7 @@ class XRefEngine:
             self._name_index = []
             for e in self._exams():
                 names = [e.name_en or "", e.name_ar or ""]
-                names += [a.original_alias for a in e.aliases if a.approval_status != "rejected"]
+                names += [a.original_alias for a in e.aliases if a.approval_status == "approved"]
                 norms = [normalize_query(n) for n in names if n]
                 self._name_index.append((e, norms))
         return self._name_index
@@ -96,6 +109,12 @@ class XRefEngine:
         self._collapsed_cache = None
         self._exam_list = None
         self._name_index = None
+        # Stale persisted resolutions must go too: an approved alias, merge or
+        # split changes what old queries should resolve to.
+        try:
+            self.db.query(SearchCache).delete()
+        except Exception:
+            self.db.rollback()
 
     def _maybe_warm(self) -> None:
         if self._alias_cache is None:
@@ -121,8 +140,21 @@ class XRefEngine:
         self._maybe_warm()
         assert self._alias_cache is not None
 
+        # RTL visual-order PDFs store source names reversed; logically-ordered
+        # sources store them straight. Try both orientations so a name matches
+        # the catalog regardless of which orientation the alias was stored in.
+        alt_raw = ""
+        if has_arabic(raw):
+            cand = fix_rtl_visual_order(raw)
+            if cand != raw:
+                alt_raw = cand
+        alt_nq = normalize_query(alt_raw) if alt_raw else ""
+        alt_coll = collapse_separators(alt_raw) if alt_raw else ""
+
         # Stage 1 — exact normalized approved alias
-        exam = self._alias_cache.get(nq)
+        exam = self._alias_cache.get(nq) or (self._alias_cache.get(alt_nq) if alt_nq else None)
+        if exam and exam.status != "active":
+            exam = None  # defensive: retired exam leaked into the alias cache
         if exam:
             res = Resolution(exam, 1.0, "exact_alias", raw)
             self._store_cache(cache_key, res)
@@ -131,7 +163,7 @@ class XRefEngine:
         # Stage 2 — collapsed separators (C.B.C / C-B-C / C B C → cbc)
         coll = collapse_separators(raw)
         assert self._collapsed_cache is not None
-        exam = self._collapsed_cache.get(coll)
+        exam = self._collapsed_cache.get(coll) or (self._collapsed_cache.get(alt_coll) if alt_coll else None)
         if exam:
             res = Resolution(exam, 0.99, "collapsed_alias", raw)
             self._store_cache(cache_key, res)
@@ -139,7 +171,9 @@ class XRefEngine:
 
         # Stage 3 — canonical names
         for e in self._exams():
-            if normalize_query(e.name_en or "") == nq or (e.name_ar and normalize_query(e.name_ar) == nq):
+            n_en = normalize_query(e.name_en or "")
+            n_ar = normalize_query(e.name_ar) if e.name_ar else ""
+            if nq in (n_en, n_ar) or (alt_nq and alt_nq in (n_en, n_ar)):
                 res = Resolution(e, 0.96, "canonical_name", raw)
                 self._store_cache(cache_key, res)
                 return res
@@ -150,13 +184,30 @@ class XRefEngine:
             for e in self._exams():
                 e_ac = acronym_of(e.name_en or "")
                 if e_ac and collapse_separators(e_ac) == ac:
-                    # confirm an approved acronym alias exists or seed acronym
-                    res = Resolution(e, 0.94, "acronym", raw)
+                    # Only trust initials-matches that are corroborated by a
+                    # registered alias; a bare initials collision (any word
+                    # "cat" vs Computerized Axial Tomography) must not
+                    # auto-approve at 0.94 — keep it above the lexical floor
+                    # but below the 0.92 auto-approve bar and flag it.
+                    registered = self._collapsed_cache.get(ac)
+                    if registered is e:
+                        res = Resolution(e, 0.94, "acronym", raw)
+                        self._store_cache(cache_key, res)
+                        return res
+                    res = Resolution(e, 0.88, "acronym_unverified", raw, needs_review=True)
                     self._store_cache(cache_key, res)
                     return res
 
         # Stage 5 — lexical candidates + attribute gate
         cands = self._lexical_candidates(raw, nq, limit=12)
+        if alt_raw:
+            # merge orientation-variant candidates, keeping the best per exam
+            by_id: dict[str, dict[str, Any]] = {c["id"]: c for c in cands}
+            for c in self._lexical_candidates(alt_raw, alt_nq, limit=6):
+                prev = by_id.get(c["id"])
+                if prev is None or c["score"] > prev["score"]:
+                    by_id[c["id"]] = c
+            cands = sorted(by_id.values(), key=lambda x: (-x["score"], x["code"]))[:12]
         if cands:
             best = cands[0]
             exam = self.db.get(Examination, best["id"])
@@ -178,6 +229,22 @@ class XRefEngine:
             return Resolution(None, sem[0]["score"] if sem else 0.0, "suggest", raw, candidates=sem, needs_review=True)
 
         return Resolution(None, 0.0, "unmatched", raw, candidates=cands + sem)
+
+    def _exam_attrs(self, e: Examination) -> dict[str, Any]:
+        """Stored attributes, with modality derived from the name when silent.
+
+        Exams created before modality extraction existed have empty attribute
+        dicts; without this derivation an X-ray record would still merge into
+        a 'CT …' exam because the exam side looks 'silent'.
+        """
+        attrs = dict(e.attributes or {})
+        if "modality" not in attrs:
+            m = extract_attributes(e.name_en or "").get("modality") or extract_attributes(
+                e.name_ar or ""
+            ).get("modality")
+            if m:
+                attrs["modality"] = m
+        return attrs
 
     def _lexical_candidates(self, raw: str, nq: str, limit: int = 10) -> list[dict[str, Any]]:
         attrs_q = extract_attributes(raw)
@@ -206,7 +273,7 @@ class XRefEngine:
                     best = s
             if best <= 0:
                 continue
-            attrs_ok = attributes_compatible(attrs_q, e.attributes or {})
+            attrs_ok = attributes_compatible(attrs_q, self._exam_attrs(e))
             if not attrs_ok:
                 best *= 0.35
             out.append({
@@ -233,7 +300,7 @@ class XRefEngine:
             s = cosine(qvec, vec)
             if s <= 0.35:
                 continue
-            attrs_ok = attributes_compatible(attrs_q, e.attributes or {})
+            attrs_ok = attributes_compatible(attrs_q, self._exam_attrs(e))
             out.append({
                 "id": e.id,
                 "code": e.canonical_code,
@@ -249,7 +316,13 @@ class XRefEngine:
     def _store_cache(self, key: str, res: Resolution) -> None:
         if not res.examination:
             return
-        row = self.db.get(SearchCache, key)
+        # autoflush=False hides this session's own pending cache rows from a
+        # plain SELECT, so two resolves of the same query in one transaction
+        # would both INSERT and collide on the primary key at commit time.
+        self.db.flush()
+        row = self.db.execute(
+            select(SearchCache).where(SearchCache.normalized_query == key)
+        ).scalar_one_or_none()
         if row:
             row.examination_id = res.examination.id
             row.confidence = res.confidence
@@ -280,12 +353,14 @@ class XRefEngine:
         nq = normalize_query(raw_alias)
         if not nq:
             return None
+        # repeated ingests can accumulate duplicate alias rows; the lookups
+        # must tolerate multiples instead of crashing the ingestion
         existing = self.db.execute(
             select(ExaminationAlias).where(
                 ExaminationAlias.normalized_alias == nq,
                 ExaminationAlias.examination_id == examination_id,
-            )
-        ).scalar_one_or_none()
+            ).order_by(ExaminationAlias.confidence.desc()).limit(1)
+        ).scalars().first()
         if existing:
             if auto_approve and existing.approval_status == "proposed":
                 existing.approval_status = "approved"
@@ -296,8 +371,8 @@ class XRefEngine:
             select(ExaminationAlias).where(
                 ExaminationAlias.original_alias == raw_alias,
                 ExaminationAlias.examination_id == examination_id,
-            )
-        ).scalar_one_or_none()
+            ).limit(1)
+        ).scalars().first()
         if dup_orig:
             return dup_orig
 
@@ -307,8 +382,8 @@ class XRefEngine:
                 ExaminationAlias.normalized_alias == nq,
                 ExaminationAlias.approval_status == "approved",
                 ExaminationAlias.examination_id != examination_id,
-            )
-        ).scalar_one_or_none()
+            ).limit(1)
+        ).scalars().first()
         status = "proposed"
         if auto_approve and not other:
             status = "approved"
@@ -376,7 +451,7 @@ class XRefEngine:
         tgt = self.db.get(Examination, target_id)
         if not src or not tgt:
             return False
-        if not attributes_compatible(src.attributes, tgt.attributes):
+        if not attributes_compatible(self._exam_attrs(src), self._exam_attrs(tgt)):
             return False
         for a in src.aliases:
             a.examination_id = target_id
