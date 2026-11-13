@@ -903,16 +903,20 @@ def parse_pdf(path: Path) -> ParsedDoc:
             except Exception:
                 pass
         t = first_text
-        if "قصر العينى" in t or "قصر العيني" in t or "kasralainy" in t.lower():
+        # visual-order PDFs store the first-page text reversed; check both
+        # orientations so provider hints fire regardless
+        t_rev = t[::-1]
+        t_all = t + "\n" + t_rev
+        if "قصر العينى" in t_all or "قصر العيني" in t_all or "kasralainy" in t.lower():
             org_hint = "مستشفى قصر العينى التعليمى الجديد"
             provider_hint = org_hint
             city_hint = "القاهرة"
-        if "المؤسسة العلاجية" in t or "العلاجية" in t or "العلاجيه" in t:
+        if "المؤسسة العلاجية" in t_all or "العلاجية" in t_all or "العلاجيه" in t_all:
             # the Therapeutic Institution publishes its own tariff; do not let
             # another hint (e.g. قصر العينى) swallow it when both appear
             org_hint = None
             provider_hint = "المؤسسة العلاجية"
-            city_hint = city_hint or "القاهرة"
+            city_hint = city_hint or "الجيزة"
         if "نقابة" in t or "النقابة" in t or "CODE" in t[:200]:
             org_hint = org_hint or "نقابة الأطباء المصرية"
         year_m = re.search(r"(20\d{2})", t)

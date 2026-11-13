@@ -26,6 +26,9 @@ from app.embeddings import cosine, get_embedder, pack_vector, unpack_vector
 from app.models import Examination, ExaminationAlias, SearchCache
 from app.normalization import (
     GENERIC_FAMILY_TOKENS,
+    ORGAN_TOKENS,
+    STOPWORDS_AR,
+    STOPWORDS_EN,
     acronym_of,
     attributes_compatible,
     collapse_separators,
@@ -37,6 +40,11 @@ from app.normalization import (
     similar,
 )
 from app.seed_catalog import NEVER_MERGE_PAIRS, SEED_EXAMS
+
+# Tokens whose presence in an exam name does not make it a different
+# procedure (prepositions/articles); anything else added to the query's
+# tokens marks a more-specific variant.
+_LEX_NOISE = STOPWORDS_EN | STOPWORDS_AR | {"علي", "لل", "ل", "ب"}
 
 
 @dataclass
@@ -266,7 +274,24 @@ class XRefEngine:
                 distinctive = {t for t in shared if t not in GENERIC_FAMILY_TOKENS}
                 if shared and not distinctive and len(nq_tokens) >= 2:
                     continue
+                # Different body parts are different procedures (رنين على
+                # المخ vs رنين على الصدر) — never candidates.
+                org_q = nq_tokens & ORGAN_TOKENS
+                org_n = nt & ORGAN_TOKENS
+                if org_q and org_n and not (org_q & org_n):
+                    continue
                 s = similar(nq, nn)
+                # Symmetric content difference: query and exam each carry a
+                # token the other lacks (المخ vs العضد, كبير vs متوسط).
+                # Those are distinct services — never auto-accept.
+                diff_q = {t for t in (nq_tokens - nt) if t not in _LEX_NOISE}
+                diff_n = {t for t in (nt - nq_tokens) if t not in _LEX_NOISE}
+                if diff_q and diff_n:
+                    s = min(s, 0.75)
+                elif diff_n:
+                    # Exam is a more-specific variant of the query
+                    # (plain MRI vs "تشبع MRI" / "with contrast").
+                    s = min(s, 0.70)
                 if compact == nq_compact and s < 0.99:
                     s = max(s, 0.93)
                 if s > best:

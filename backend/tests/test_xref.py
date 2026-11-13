@@ -59,7 +59,22 @@ def test_urine_analysis_vs_culture(db):
 def test_arabic_mri(db):
     x = XRefEngine(db)
     r = x.resolve("رنين مغناطيسي على المخ")
-    assert r.examination and r.examination.canonical_code == "RAD-010001"
+    # The seed shell RAD-010001 may have been merged into the ingested MRI
+    # Brain exam; assert the resolved exam IS a brain MRI, not a code.
+    assert r.examination and "mri" in (r.examination.name_en or "").lower()
+    assert "المخ" in (r.examination.name_ar or "")
+
+
+def test_organ_differentiator(db):
+    """Body parts are differentiators: a brain MRI must never resolve to a
+    chest/abdomen MRI even when the rest of the phrase matches."""
+    x = XRefEngine(db)
+    r = x.resolve("رنين مغناطيسي على المخ")
+    assert r.examination is None or "الصدر" not in (r.examination.name_ar or "")
+    a = x.resolve("سونار على البطن", use_cache=False)
+    b = x.resolve("سونار على الحوض", use_cache=False)
+    if a.examination and b.examination and a.confidence >= 0.88 and b.confidence >= 0.88:
+        assert a.examination.id != b.examination.id
 
 
 def test_search_engine_structure(db):

@@ -29,7 +29,8 @@ from app.models import (
 LAB_DOCS = [
     "Others 2026.pdf",
     "القائمة المكملة 2026.pdf",
-    "المؤسسة العلاجية 2023.pdf",  # the lab booklet inside المختبر و البرج
+    # NOTE: المؤسسة العلاجية 2023.pdf is the hospital's own booklet; the
+    # ingest-time provider hint attaches it to المؤسسة العلاجية directly.
 ]
 
 

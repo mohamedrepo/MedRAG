@@ -206,6 +206,37 @@ STOPWORDS_AR = {
     "صورة", "كاملة", "الدم", "الام", "آلام",
 }
 
+# Body-part tokens: two exams imaging DIFFERENT body parts are different
+# procedures no matter how similar the rest of the name is (رنين على المخ vs
+# رنين على الصدر). Candidates whose organ tokens disagree are rejected.
+ORGAN_TOKENS = {
+    # Arabic (definite forms as produced by normalize_query)
+    "المخ", "الدماغ", "الصدر", "البطن", "الحوض", "الرقبة", "الركبة",
+    "الكتف", "الكوع", "الرسغ", "اليد", "القدم", "الساق", "الفخذ",
+    "العضد", "الساعد", "النخاع", "العصب", "الأعصاب", "العضلة", "العضلات",
+    "المفصل", "المفاصل", "الغضروف", "الأربطة", "الوتر", "الأوتار",
+    "الوجه", "العين", "العينين", "الانف", "الاذن", "الأذن", "الفم",
+    "الكلى", "الكلي", "الكليتان", "الكبد", "الرئة", "الرئتين", "القلب",
+    "الثدي", "الثديين", "المرارة", "الطحال", "البروستاتا", "الرحم",
+    "المبيض", "المبايض", "الغدة", "الدرقية", "الفك", "الفكين",
+    "السن", "الاسنان", "الأسنان", "الضرس", "الضروس", "العمود", "الفقرات",
+    "الفقرية", "المريء", "المعدة", "القولون", "الأمعاء", "الأمعاء",
+    "المثانة", "البنكرياس", "الحالب", "المسالك", "الناصور", "القضيب",
+    "المهبل", "المستقيم", "الشرج", "الخلج", "الكاحل", "السمانة",
+    "الحدقة", "الجفن", "الجفون", "اللوزتين", "اللحمية", "الغدة",
+    "الجيوب", "الأنفية", "الحنجرة", "البلعوم", "الحبال", "الصوتية",
+    "الصدر", "الظهر", "العجز", "العصعص", "الترقوة", "الضلعون", "الاضلاع",
+    "الشريان", "الشرايين", "الوردة", "الاوردة", "الأوردة", "الوعائي",
+    # English
+    "brain", "chest", "abdomen", "pelvis", "knee", "shoulder", "elbow",
+    "wrist", "hand", "foot", "leg", "thigh", "face", "eye", "kidney",
+    "liver", "lung", "heart", "breast", "gallbladder", "spleen",
+    "prostate", "uterus", "ovary", "thyroid", "jaw", "tooth", "teeth",
+    "spine", "esophagus", "stomach", "colon", "intestine", "bladder",
+    "pancreas", "urethra", "pituitary", "sinus", "neck", "hip", "ankle",
+    "artery", "arteries", "vein", "veins",
+}
+
 # Tokens that alone must not drive a merge (Vitamin A vs Vitamin D).
 GENERIC_FAMILY_TOKENS = {
     "vitamin", "vit", "فيتامين", "فيامين", "هرمون", "hormone",

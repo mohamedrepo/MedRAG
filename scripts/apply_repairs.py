@@ -69,6 +69,15 @@ DEACTIVATE = {
     ("عيادات خارجية  2026 القاهرة.pdf", "100% 70% 60% 50% 30%"),
 }
 
+# Garbled names the similarity pass cannot safely match (too mangled or
+# digit-reversed prices); decoded by hand from the page images.
+MANUAL_DECODE = {
+    "جهاز مزخة محالضل أو سرنجة محالضل يؾميا":
+        ("جهاز مضخة محاليل أو سرنجة محاليل يومياً", 160.0),
+    "المبؾمضؽ": ("الألبومين", 80.0),
+    "ماغشدضؾـ": ("ماغنسيوم", 110.0),
+}
+
 
 def parse_transcript(path: Path) -> list[tuple[list[float], str]]:
     rows: list[tuple[list[float], str]] = []
@@ -167,6 +176,10 @@ def main() -> None:
                             best = (sim, name, true_price)
                     if best and best[0] >= 0.5:
                         decoded[r.id] = (best[1], best[2])
+                    if r.id not in decoded:
+                        manual = MANUAL_DECODE.get((r.original_name or "").strip())
+                        if manual:
+                            decoded[r.id] = manual
             stats["decoded"] = len(decoded)
 
             # rename records + correct corrupted values

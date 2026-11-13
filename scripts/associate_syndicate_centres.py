@@ -43,7 +43,8 @@ SYNDICATE_PROVIDER = "نقابة الاطباء 2026"
 # centre name -> the source documents (owned by the syndicate provider) that
 # carry the tariff this centre reports
 CENTRES = {
-    "مركز الطاهرة": ["أشعة 2026 قاهرة.pdf", "تحاليل 2026 قاهرة.pdf"],
+    # a centre reports exactly the lists sitting in its folder
+    "مركز الطاهرة": ["أشعة 2026 قاهرة.pdf"],
     "مركز النيل للاشعه": ["أشعة 2026 قاهرة.pdf", "تحاليل 2026 قاهرة.pdf"],
 }
 

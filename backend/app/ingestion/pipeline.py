@@ -9,6 +9,7 @@ Accuracy rules enforced here:
 """
 from __future__ import annotations
 
+import re
 import shutil
 from datetime import date, datetime
 from pathlib import Path
@@ -22,6 +23,12 @@ from app.embeddings import get_embedder, pack_vector
 from app.ingestion.base import ParsedDoc, RawRow, file_checksum, sniff_format, split_name_bilingual
 from app.ingestion.office_parsers import parse_csv, parse_docx, parse_image, parse_txt_or_html, parse_xlsx
 from app.ingestion.pdf_parsers import parse_pdf
+
+_LETTERS_RE = re.compile(r"[A-Za-z؀-ۿ]")
+
+
+def _has_letters(s: str | None) -> bool:
+    return bool(s and _LETTERS_RE.search(s))
 from app.models import (
     Examination,
     IngestionReport,
@@ -258,9 +265,14 @@ class IngestionPipeline:
                 continue
 
             res = self.xref.resolve(name, use_cache=False)
-            if not res.examination and raw.name_en and raw.name_en != name:
+            # Only fall back to the raw bilingual halves when they carry real
+            # text: a debris cell like '( )' would resolve to the existing
+            # '( )' exam and drag unrelated services onto it.
+            if not res.examination and raw.name_en and raw.name_en != name \
+                    and _has_letters(raw.name_en):
                 res = self.xref.resolve(raw.name_en, use_cache=False)
-            if not res.examination and raw.name_ar and raw.name_ar != name:
+            if not res.examination and raw.name_ar and raw.name_ar != name \
+                    and _has_letters(raw.name_ar):
                 res = self.xref.resolve(raw.name_ar, use_cache=False)
             # Mixed bilingual source names: try the Latin half even when the
             # full string failed, and vice versa.
@@ -291,6 +303,10 @@ class IngestionPipeline:
                 ar, en = raw.name_ar, raw.name_en
                 if not ar and not en:
                     ar, en = split_name_bilingual(name)
+                if en and not _has_letters(en):
+                    en = None  # debris cell — never name an exam after it
+                if ar and not _has_letters(ar):
+                    ar = None
                 exam = Examination(
                     canonical_code=next_canonical_code(self.db, raw.category or "Other"),
                     name_en=en or name,
