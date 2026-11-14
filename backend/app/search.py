@@ -68,9 +68,13 @@ class SearchEngine:
                 # only included when explicitly requested
                 pass
 
-        # If unresolved, fall back to fuzzy exam-name search
+        # If unresolved, fall back to fuzzy exam-name search. The exam cap
+        # must scale with the row limit: capping at 8 exams silently dropped
+        # whole centres from generic queries (e.g. 'Cortisol' matches 18
+        # exams across 5 centres, but only the top 8 exams' rows appeared,
+        # so معمل البرج/المختبر never showed).
         if not res.examination:
-            fuzzy = self._fuzzy_exams(q, limit=8)
+            fuzzy = self._fuzzy_exams(q, limit=max(8, min(40, limit)))
             exam_ids = [e.id for e in fuzzy]
             res.candidates = res.candidates or [
                 {"id": e.id, "code": e.canonical_code, "name_en": e.name_en, "name_ar": e.name_ar, "score": 0.6}
